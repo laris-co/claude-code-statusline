@@ -3,14 +3,14 @@
 A Starship-inspired status line for [Claude Code](https://claude.ai/claude-code) CLI with icons, git info, context usage, and auto-compact detection.
 
 ```
-🕐 12:35 📂 ~/my-project on  main* • 🤖 Opus 4.6 • 📊 35% (56k/160k) • 🔄 auto-compact
+🕐 12:35 📂 ~/my-project on  main* • 🤖 Opus 4.6 • 💰 $1.55 ⏱ 42m • 📊 35% (56k/160k) • 🔄 auto-compact
 ```
 
 Auto-adapts to narrow terminals:
 
 ```
 🕐 12:35 📂 ~/my-project on  main* • 🤖 Opus 4.6
-📊 35% (56k/160k) • 🔄 auto-compact
+💰 $1.55 ⏱ 42m • 📊 35% (56k/160k) • 🔄 auto-compact
 ```
 
 ## Features
@@ -23,6 +23,8 @@ Auto-adapts to narrow terminals:
 | 🌳 | Git worktree name (when in a worktree) |
 | 🤖 | Model name (Opus 4.6, Sonnet 4.6, etc.) |
 | 📊 | Context usage — % and tokens (used/effective max) |
+| 💰 | Session cost (USD) |
+| ⏱ | Session duration |
 | 🔄/❌ | Auto-compact on/off |
 
 ### Effective context window
@@ -112,11 +114,17 @@ The auto-compact status isn't in the statusLine JSON. We found it by digging thr
 
 Edit `~/.claude/statusline-command.sh` to add more fields:
 
-- `cost.total_cost_usd` — session spend
-- `cost.total_duration_ms` — session duration
 - `vim.mode` — vim mode (NORMAL/INSERT/etc.)
 - `worktree.name` — Claude Code worktree name
 - `output_style.name` — output style
+
+### AI self-awareness (statusline.json)
+
+The script saves a compact JSON snapshot to `~/Code/github.com/laris-co/homelab/ψ/active/statusline.json` on every update. This lets other AI agents read the current session state:
+
+```json
+{"timestamp":"2026-03-10T16:35:00Z","cwd":"/home/nat/project","model":"Opus 4.6","context_pct":35,"cost_usd":1.55,"duration_ms":2520000,"version":"2.1.71"}
+```
 
 ## License
 

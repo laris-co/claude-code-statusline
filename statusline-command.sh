@@ -56,12 +56,45 @@ else
   fi
 fi
 
+# Cost
+cost=$(echo "$input" | jq -r '.cost.total_cost_usd // 0')
+cost_fmt=$(printf '%.2f' "$cost" 2>/dev/null || echo "0.00")
+
+# Session duration
+duration_ms=$(echo "$input" | jq -r '.cost.total_duration_ms // 0' | cut -d. -f1)
+if [ "$duration_ms" -gt 0 ] 2>/dev/null; then
+  total_sec=$((duration_ms / 1000))
+  dur_h=$((total_sec / 3600))
+  dur_m=$(( (total_sec % 3600) / 60 ))
+  if [ "$dur_h" -gt 0 ]; then
+    duration="${dur_h}h${dur_m}m"
+  else
+    duration="${dur_m}m"
+  fi
+else
+  duration="0m"
+fi
+
+# Save statusline JSON for AI self-awareness
+statusline_json="${HOME}/Code/github.com/laris-co/homelab/ψ/active/statusline.json"
+if [ -d "$(dirname "$statusline_json")" ]; then
+  echo "$input" | jq -c '{
+    timestamp: now | todate,
+    cwd: (.workspace.current_dir // .cwd),
+    model: (.model.display_name // .model.id),
+    context_pct: (.context_window.used_percentage // 0),
+    cost_usd: (.cost.total_cost_usd // 0),
+    duration_ms: (.cost.total_duration_ms // 0),
+    version: (.version // "unknown")
+  }' > "$statusline_json" 2>/dev/null
+fi
+
 # Time
 now=$(date '+%H:%M')
 
 # Build one-line version, split to two if too long
 line1=$(printf '🕐 %s 📂 %s%s • 🤖 %s' "$now" "$display_dir" "$git_info" "$model")
-line2=$(printf '📊 %s%% (%sk/%sk) • %s' "$pct" "$used_k" "$max_k" "$compact_icon")
+line2=$(printf '💰 $%s ⏱ %s • 📊 %s%% (%sk/%sk) • %s' "$cost_fmt" "$duration" "$pct" "$used_k" "$max_k" "$compact_icon")
 oneline="$line1 • $line2"
 
 # Get terminal width (fallback 80)
