@@ -5,6 +5,9 @@
 
 input=$(cat)
 
+# One-time capture: save full raw JSON
+echo "$input" > /tmp/statusline-raw.json 2>/dev/null
+
 # Extract JSON data
 cwd=$(echo "$input" | jq -r '.workspace.current_dir // .cwd // "~"')
 model=$(echo "$input" | jq -r '.model.display_name // .model.id // "Claude"')
@@ -12,12 +15,8 @@ pct=$(echo "$input" | jq -r '.context_window.used_percentage // 0' | cut -d. -f1
 used_k=$(echo "$input" | jq -r '((.context_window.current_usage | .input_tokens + .cache_creation_input_tokens + .cache_read_input_tokens + .output_tokens) // 0) / 1000 | floor')
 max_k=$(echo "$input" | jq -r '(.context_window.context_window_size // 0) / 1000 | floor')
 
-# Format directory (~ for home)
-if [[ "$cwd" == "$HOME"* ]]; then
-  display_dir="${cwd/#$HOME/~}"
-else
-  display_dir="$cwd"
-fi
+# Shorten /home/user to ~
+display_dir="${cwd/#$HOME/\~}"
 
 # Git branch + worktree
 git_info=""
@@ -56,10 +55,6 @@ else
   fi
 fi
 
-# Cost
-cost=$(echo "$input" | jq -r '.cost.total_cost_usd // 0')
-cost_fmt=$(printf '%.2f' "$cost" 2>/dev/null || echo "0.00")
-
 # Session duration
 duration_ms=$(echo "$input" | jq -r '.cost.total_duration_ms // 0' | cut -d. -f1)
 if [ "$duration_ms" -gt 0 ] 2>/dev/null; then
@@ -89,20 +84,18 @@ if [ -d "$(dirname "$statusline_json")" ]; then
   }' > "$statusline_json" 2>/dev/null
 fi
 
+# Hostname (show globe for remote machines)
+host=$(hostname -s 2>/dev/null || echo "")
+if [ -n "$host" ] && [ "$host" != "$(whoami)" ]; then
+  host_info="🌐 ${host} "
+else
+  host_info=""
+fi
+
 # Time
 now=$(date '+%H:%M')
 
-# Build one-line version, split to two if too long
-line1=$(printf '🕐 %s 📂 %s%s • 🤖 %s' "$now" "$display_dir" "$git_info" "$model")
-line2=$(printf '💰 $%s ⏱ %s • 📊 %s%% (%sk/%sk) • %s' "$cost_fmt" "$duration" "$pct" "$used_k" "$max_k" "$compact_icon")
-oneline="$line1 • $line2"
-
-# Get terminal width (fallback 80)
-cols=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
-
-# If one line fits, use it; otherwise split
-if [ ${#oneline} -le "$cols" ]; then
-  printf '%s' "$oneline"
-else
-  printf '%s\n%s' "$line1" "$line2"
-fi
+# Line 1: host + path + branch + key stats (condensed for 2.1.74 which only shows line 1)
+echo "${host_info}📂 ${display_dir}${git_info} • ${now} ⏱${duration} • 📊${pct}% (${used_k}k/${max_k}k) ${compact_icon} • 🤖 ${model}"
+# Line 2: full stats (shown on 2.1.72, dropped on 2.1.74)
+echo "🕐 ${now} ⏱ ${duration} • 📊 ${pct}% (${used_k}k/${max_k}k) • ${compact_icon} • 🤖 ${model}"
