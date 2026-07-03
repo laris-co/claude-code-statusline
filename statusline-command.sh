@@ -1,101 +1,262 @@
 #!/bin/bash
+# Claude Code statusline — adapted from white.local for m5
+# Lines:
+#   [optional] 🌱 incubate / 🌳 worktree origin
+#   📁 cwd on branch* + token
+#   📡 sid prev → • time • pct • skills • model
+#   🌐 federation status (cached, async refresh)
 
-# Claude Code status line — Starship-inspired with icons
-# Receives JSON on stdin from Claude Code
+# macOS shim: timeout(1) is not in the base system; use gtimeout if installed,
+# otherwise drop the duration and run the command directly.
+if ! command -v timeout >/dev/null 2>&1; then
+  if command -v gtimeout >/dev/null 2>&1; then
+    timeout() { gtimeout "$@"; }
+  else
+    timeout() { shift; "$@"; }
+  fi
+fi
 
 input=$(cat)
+mkdir -p "/tmp/claude-statusline" 2>/dev/null
+echo "$input" > "/tmp/claude-statusline/raw.json" 2>/dev/null
 
-# One-time capture: save full raw JSON
-echo "$input" > /tmp/statusline-raw.json 2>/dev/null
+cwd=$(echo "$input" | jq -r '.workspace.current_dir // .cwd // "~"' 2>/dev/null) || cwd="~"
+model=$(echo "$input" | jq -r '.model.display_name // .model.id // "?"' 2>/dev/null) || model="?"
+thinking=$(echo "$input" | jq -r '.thinking.enabled // false' 2>/dev/null)
+effort=$(echo "$input" | jq -r '.effort.level // "?"' 2>/dev/null)
+fast=$(echo "$input" | jq -r '.fast_mode // false' 2>/dev/null)
+pct=$(echo "$input" | jq -r '.context_window.used_percentage // 0' 2>/dev/null | cut -d. -f1) || pct=0
+used_k=$(echo "$input" | jq -r '((.context_window.current_usage | ((.input_tokens//0)+(.cache_creation_input_tokens//0)+(.cache_read_input_tokens//0)+(.output_tokens//0))) / 1000) | floor' 2>/dev/null) || used_k=0
+max_k=$(echo "$input" | jq -r '((.context_window.context_window_size // 0) / 1000) | floor' 2>/dev/null) || max_k=0
 
-# Extract JSON data
-cwd=$(echo "$input" | jq -r '.workspace.current_dir // .cwd // "~"')
-model=$(echo "$input" | jq -r '.model.display_name // .model.id // "Claude"')
-pct=$(echo "$input" | jq -r '.context_window.used_percentage // 0' | cut -d. -f1)
-used_k=$(echo "$input" | jq -r '((.context_window.current_usage | .input_tokens + .cache_creation_input_tokens + .cache_read_input_tokens + .output_tokens) // 0) / 1000 | floor')
-max_k=$(echo "$input" | jq -r '(.context_window.context_window_size // 0) / 1000 | floor')
+# Only override to 1M if CLAUDE_CODE_DISABLE_1M_CONTEXT is NOT set.
+if [ "${CLAUDE_CODE_DISABLE_1M_CONTEXT:-}" != "1" ]; then
+  case "$model" in
+    *Opus*4*|*Sonnet*4*|*opus-4*|*sonnet-4*)
+      if [ -n "$max_k" ] && [ "$max_k" -le 200 ] 2>/dev/null; then
+        max_k=1000
+        [ "$used_k" -gt 0 ] 2>/dev/null && pct=$(( (used_k * 100) / max_k ))
+        [ "$pct" -gt 100 ] && pct=100
+        input=$(echo "$input" | jq -c '.context_window.context_window_size = 1000000 | .context_window.used_percentage = '"$pct"'' 2>/dev/null) || true
+      fi
+      ;;
+  esac
+fi
 
-# Shorten /home/user to ~
-display_dir="${cwd/#$HOME/\~}"
+# Detect wrong context_window_size: if used_k overflows max_k, the JSON's
+# window size is wrong (Claude Code bug for Opus 4.6/4.7/4.8 1M variants).
+# Heuristic: if used > reported window, the real window is 1M.
+if [ -n "$used_k" ] && [ -n "$max_k" ] && [ "$max_k" -gt 0 ] && [ "$used_k" -gt "$max_k" ] 2>/dev/null; then
+  max_k=1000
+  pct=$(( (used_k * 100) / max_k ))
+  [ "$pct" -gt 100 ] && pct=100
+  input=$(echo "$input" | jq -c '.context_window.context_window_size = 1000000 | .context_window.used_percentage = '"$pct"'' 2>/dev/null) || true
+fi
+over_flag=""
+dur_ms=$(echo "$input" | jq -r '.cost.total_duration_ms // 0' 2>/dev/null | cut -d. -f1) || dur_ms=0
 
-# Git branch + worktree
-git_info=""
-if git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
-  branch=$(git -C "$cwd" symbolic-ref --short HEAD 2>/dev/null || git -C "$cwd" rev-parse --short HEAD 2>/dev/null)
-  if [ -n "$branch" ]; then
-    dirty=""
-    if ! git -C "$cwd" diff-index --quiet HEAD -- 2>/dev/null; then
-      dirty="*"
+# Rate limit — Bufo-display style (5h + wk bars with countdowns)
+rl_5h_pct=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // 0' 2>/dev/null | cut -d. -f1)
+rl_5h_reset=$(echo "$input" | jq -r '.rate_limits.five_hour.resets_at // 0' 2>/dev/null | cut -d. -f1)
+rl_7d_pct=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // 0' 2>/dev/null | cut -d. -f1)
+rl_7d_reset=$(echo "$input" | jq -r '.rate_limits.seven_day.resets_at // 0' 2>/dev/null | cut -d. -f1)
+# Floor empties to 0
+[ -z "$rl_5h_pct" ] && rl_5h_pct=0
+[ -z "$rl_7d_pct" ] && rl_7d_pct=0
+
+fmt_until() {
+  local secs=$(( ${1:-0} - $(date +%s) ))
+  if [ "$secs" -le 0 ]; then echo "now"
+  elif [ "$secs" -ge 86400 ]; then echo "$(( secs / 86400 ))d$(( (secs % 86400) / 3600 ))h"
+  elif [ "$secs" -ge 3600 ]; then echo "$(( secs / 3600 ))h$(( (secs % 3600) / 60 ))m"
+  else echo "$(( secs / 60 ))m"
+  fi
+}
+
+# 10-segment progress bar — ▓ filled, ░ empty (Bufo LCD aesthetic)
+qbar() {
+  local pct=${1:-0}
+  [ "$pct" -gt 100 ] 2>/dev/null && pct=100
+  [ "$pct" -lt 0 ]   2>/dev/null && pct=0
+  local filled=$(( (pct + 5) / 10 ))   # round to nearest 10%
+  local i b=""
+  for ((i=0; i<filled; i++)); do b="${b}▓"; done
+  for ((i=filled; i<10; i++)); do b="${b}░"; done
+  echo "$b"
+}
+
+# Status dot — green <50, yellow 50-79, red 80+
+qdot() {
+  local pct=${1:-0}
+  if   [ "$pct" -ge 80 ] 2>/dev/null; then echo "🔴"
+  elif [ "$pct" -ge 50 ] 2>/dev/null; then echo "🟡"
+  else echo "🟢"
+  fi
+}
+
+rl_5h_line=""
+rl_wk_line=""
+[ "${rl_5h_reset:-0}" != "0" ] && rl_5h_line="$(qdot ${rl_5h_pct}) 5h  $(qbar ${rl_5h_pct}) ${rl_5h_pct}% $(fmt_until ${rl_5h_reset:-0})"
+[ "${rl_7d_reset:-0}" != "0" ] && rl_wk_line="$(qdot ${rl_7d_pct}) wk  $(qbar ${rl_7d_pct}) ${rl_7d_pct}% $(fmt_until ${rl_7d_reset:-0})"
+
+# Duration
+s=$(( dur_ms / 1000 )) 2>/dev/null || s=0
+h=$(( s / 3600 )); m=$(( (s % 3600) / 60 ))
+[ "$h" -gt 0 ] 2>/dev/null && dur="${h}h${m}m" || dur="${m}m"
+
+# Auto-compact
+ac="❌"
+jq -e '.autoCompactEnabled != false' ~/.claude.json >/dev/null 2>&1 && ac="✅"
+
+# Git branch (timeout to avoid hangs)
+branch=$(timeout 2 git -C "$cwd" symbolic-ref --short HEAD 2>/dev/null)
+git=""
+if [ -n "$branch" ]; then
+  d=""; timeout 1 git -C "$cwd" diff-index --quiet HEAD -- 2>/dev/null || d="*"
+  wt=""; [ -f "$cwd/.git" ] && wt=" 🌳"
+  git="  ${branch}${d}${wt}"
+fi
+
+# Active Claude token — via token-cli current (fast, cached .envrc parse)
+tok=""
+if command -v token-cli >/dev/null 2>&1; then
+  tok=$(cd "$cwd" 2>/dev/null && timeout 1 token-cli current 2>/dev/null)
+fi
+tok_info=""
+[ -n "$tok" ] && tok_info=" 🔐${tok}"
+
+# Shorten path to org/repo (strip ghq root prefix)
+GHQ_ROOT=$(ghq root 2>/dev/null || echo "$HOME/Code")
+dir="${cwd/#${GHQ_ROOT}\/github.com\//}"
+dir="${dir/#github.com\//}"
+# Fallback: if nothing was stripped, replace $HOME with ~
+[ "$dir" = "$cwd" ] && dir="${cwd/#$HOME/\~}"
+
+
+# Session ID (short)
+sid=$(echo "$input" | jq -r '.session_id // ""' 2>/dev/null | cut -c1-8)
+
+# Previous session ID
+ENCODED_CWD=$(echo "$cwd" | sed 's|/|-|g; s|\.|-|g')
+PROJ_DIR="$HOME/.claude/projects/${ENCODED_CWD}"
+prev_sid=$(ls -t "$PROJ_DIR"/*.jsonl 2>/dev/null | head -2 | tail -1 | xargs -I{} basename {} .jsonl 2>/dev/null | cut -c1-8)
+prev_info=""
+[ -n "$prev_sid" ] && [ "$prev_sid" != "$sid" ] && prev_info="${prev_sid} → "
+
+# Incubation detection — set 🌱 if cwd path contains /ψ/incubate/.
+# Cheap substring check (no filesystem walk) — see issue laris-co/claude-code-statusline#1.
+incubate=""
+case "$cwd" in
+  */ψ/incubate/*)
+    parent=$(echo "$cwd" | sed "s|.*/\([^/]*\)/ψ/incubate/.*|\1|; s|\.wt-.*||")
+    incubate=" 🌱 ${parent}"
+    ;;
+esac
+
+# Worktree origin detection — find which .wt-* project dir owns this session
+sid_full=$(echo "$input" | jq -r '.session_id // ""' 2>/dev/null)
+wt_dir=""
+for pdir in "$HOME"/.claude/projects/*wt-*; do
+  [ -f "$pdir/${sid_full}.jsonl" ] || continue
+  pname=$(basename "$pdir")
+  for d in "$HOME"/Code/github.com/*/*.wt-*; do
+    [ -d "$d" ] || continue
+    encoded=$(echo "$d" | sed 's|/|-|g; s|\.|-|g')
+    [ "$pname" = "$encoded" ] && wt_dir="$d" && break
+  done
+  break
+done 2>/dev/null
+wt_info=""
+if [ -n "$wt_dir" ] && [ "$wt_dir" != "$cwd" ]; then
+  wt_short="${wt_dir/#$HOME\/Code\/github.com\//}"
+  wt_branch=$(timeout 2 git -C "$wt_dir" symbolic-ref --short HEAD 2>/dev/null)
+  [ -n "$wt_branch" ] && wt_info=" 🌳 ${wt_short} on  ${wt_branch}"
+fi
+
+# Federation status (cached, async refresh — never blocks the prompt)
+FED_BAR="${GHQ_ROOT}/github.com/Soul-Brews-Studio/m5-federation-oracle/scripts/fed-status-bar.sh"
+fed_line=""
+if [ -x "$FED_BAR" ]; then
+  fed_line="$("$FED_BAR" 2>/dev/null)"
+fi
+
+host=$(scutil --get LocalHostName 2>/dev/null || hostname -s 2>/dev/null || hostname)
+
+# MQTT publish — fire-and-forget telemetry to mqtt.laris.co.
+# Topic: claude/<machine>/<user>/<oracle>/<session>
+# Backgrounded so it never blocks prompt render. -r retained so subscribers get latest state on connect.
+# Password from pass store (mqtt/laris-co/nat).
+if command -v mosquitto_pub >/dev/null 2>&1 && command -v pass >/dev/null 2>&1; then
+  mqtt_host=$(echo "$host" | tr '[:upper:]' '[:lower:]')
+  mqtt_user=$(whoami)
+  # Walk up dirs to find CLAUDE.md with "**I am**:" line — handles subdir cwd.
+  mqtt_oracle=""
+  walk_dir="$cwd"
+  for _ in 1 2 3 4 5; do
+    if [ -f "$walk_dir/CLAUDE.md" ]; then
+      cand=$(grep -E "^\*\*I am\*\*:" "$walk_dir/CLAUDE.md" 2>/dev/null | sed -E 's/.*: //; s/ —.*//' | tr '[:upper:]' '[:lower:]' | head -1)
+      [ -n "$cand" ] && mqtt_oracle="$cand" && break
     fi
-    # Check if in a worktree (git dir is a file pointing to main repo)
-    wt=""
-    git_dir=$(git -C "$cwd" rev-parse --git-dir 2>/dev/null)
-    if [ -f "$git_dir" ] || echo "$input" | jq -e '.worktree' >/dev/null 2>&1; then
-      wt_name=$(echo "$input" | jq -r '.worktree.name // empty' 2>/dev/null)
-      [ -z "$wt_name" ] && wt_name=$(basename "$cwd")
-      wt=" 🌳 ${wt_name}"
-    fi
-    git_info=" on  ${branch}${dirty}${wt}"
+    parent=$(dirname "$walk_dir")
+    [ "$parent" = "$walk_dir" ] && break
+    walk_dir="$parent"
+  done
+  # Fallback: use git toplevel basename minus -oracle suffix.
+  if [ -z "$mqtt_oracle" ]; then
+    top=$(timeout 1 git -C "$cwd" rev-parse --show-toplevel 2>/dev/null)
+    mqtt_oracle=$(basename "${top:-$cwd}" | sed 's/-oracle$//' | tr '[:upper:]' '[:lower:]')
+  fi
+  mqtt_topic="claude/${mqtt_host}/${mqtt_user}/${mqtt_oracle}/${sid:-unknown}"
+  mqtt_pass=$(timeout 1 pass show mqtt/laris-co/nat 2>/dev/null)
+  if [ -n "$mqtt_pass" ]; then
+    # Enrich payload with branch / worktree / fed / oracle that aren't in raw input.
+    published_at=$(($(date +%s) * 1000))   # millisecond epoch
+    enriched=$(echo "$input" | jq -c \
+      --arg branch "${branch:-}" \
+      --arg wt_short "${wt_short:-}" \
+      --arg wt_branch "${wt_branch:-}" \
+      --arg fed "${fed_line:-}" \
+      --arg oracle "$mqtt_oracle" \
+      --arg machine "$mqtt_host" \
+      --arg dir "$dir" \
+      --arg dirty "${d:-}" \
+      --argjson published_at "$published_at" \
+      --argjson corrected_max_k "${max_k:-0}" \
+      --argjson corrected_used_k "${used_k:-0}" \
+      --argjson corrected_pct "${pct:-0}" \
+      --argjson remaining_k "$(( max_k - used_k > 0 ? max_k - used_k : 0 ))" \
+      '. + {oracle: $oracle, machine: $machine, branch: $branch, branch_dirty: ($dirty != ""), worktree: $wt_short, worktree_branch: $wt_branch, federation: $fed, short_dir: $dir, published_at: $published_at, context_window: (.context_window + {corrected_window_size: ($corrected_max_k * 1000), corrected_used_k: $corrected_used_k, corrected_pct: $corrected_pct, remaining_k: $remaining_k})}' \
+      2>/dev/null)
+    [ -z "$enriched" ] && enriched="$input"
+    (printf '%s' "$enriched" | mosquitto_pub -h mqtt.laris.co -p 1883 -u nat -P "$mqtt_pass" -t "$mqtt_topic" -s -q 0 -r &) 2>/dev/null
   fi
 fi
 
-# Auto-compact: key only exists in ~/.claude.json when disabled (false)
-# Absent = enabled (default), false = disabled
-# When enabled, triggers at ~80% so effective max is 80% of context window
-compact_val=$(jq -r 'if .autoCompactEnabled == false then "false" else "true" end' ~/.claude.json 2>/dev/null)
-compact_pct=${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE:-80}
-if [ "$compact_val" = "false" ]; then
-  compact_icon="❌ auto-compact"
-else
-  compact_icon="🔄 auto-compact"
-  max_k=$((max_k * compact_pct / 100))
-  # Recalculate pct against effective max
-  if [ "$max_k" -gt 0 ]; then
-    pct=$((used_k * 100 / max_k))
-  fi
+# Oracle skills version (used on host line + footer)
+skl_ver=$(head -3 ~/.claude/skills/rrr/SKILL.md 2>/dev/null | grep -o 'v[0-9.]*' | head -1)
+
+[ -n "$wt_info" ] && echo "${incubate}${wt_info}"
+echo "🖥  ${host}  📁 ${dir}${git}${tok_info}  ·  🔮${skl_ver:-?}"
+[ -n "$incubate" ] && echo "   📂 ${cwd}"
+
+ctx_dot=$(qdot ${pct:-0})
+ctx_bar=$(qbar ${pct:-0})
+# Reasoning mode tag
+reason_tag=""
+if [ "$fast" = "true" ]; then
+  reason_tag=" ⚡fast"
+elif [ "$thinking" = "true" ]; then
+  reason_tag=" 🧠${effort}"
 fi
-
-# Session duration
-duration_ms=$(echo "$input" | jq -r '.cost.total_duration_ms // 0' | cut -d. -f1)
-if [ "$duration_ms" -gt 0 ] 2>/dev/null; then
-  total_sec=$((duration_ms / 1000))
-  dur_h=$((total_sec / 3600))
-  dur_m=$(( (total_sec % 3600) / 60 ))
-  if [ "$dur_h" -gt 0 ]; then
-    duration="${dur_h}h${dur_m}m"
-  else
-    duration="${dur_m}m"
-  fi
-else
-  duration="0m"
+# Header line — sid · time · model · reasoning · fed · version (all meta together)
+echo "📡 ${prev_info}${sid} • $(date +%H:%M) • ${model}${reason_tag}"
+# 3 clean bars stacked: ctx / 5h+fed / wk
+echo "${ctx_dot} ctx ${ctx_bar} ${pct}% ${used_k}k${over_flag}/${max_k}k"
+if [ -n "$rl_5h_line" ] && [ -n "$fed_line" ]; then
+  echo "${rl_5h_line}  🌐 ${fed_line}"
+elif [ -n "$rl_5h_line" ]; then
+  echo "$rl_5h_line"
+elif [ -n "$fed_line" ]; then
+  echo "🌐 ${fed_line}"
 fi
-
-# Save statusline JSON for AI self-awareness
-statusline_json="${HOME}/Code/github.com/laris-co/homelab/ψ/active/statusline.json"
-if [ -d "$(dirname "$statusline_json")" ]; then
-  echo "$input" | jq -c '{
-    timestamp: now | todate,
-    cwd: (.workspace.current_dir // .cwd),
-    model: (.model.display_name // .model.id),
-    context_pct: (.context_window.used_percentage // 0),
-    cost_usd: (.cost.total_cost_usd // 0),
-    duration_ms: (.cost.total_duration_ms // 0),
-    version: (.version // "unknown")
-  }' > "$statusline_json" 2>/dev/null
-fi
-
-# Hostname (show globe for remote machines)
-host=$(hostname -s 2>/dev/null || echo "")
-if [ -n "$host" ] && [ "$host" != "$(whoami)" ]; then
-  host_info="🌐 ${host} "
-else
-  host_info=""
-fi
-
-# Time
-now=$(date '+%H:%M')
-
-# Line 1: host + path + branch + key stats (condensed for 2.1.74 which only shows line 1)
-echo "${host_info}📂 ${display_dir}${git_info} • ${now} ⏱${duration} • 📊${pct}% (${used_k}k/${max_k}k) ${compact_icon} • 🤖 ${model}"
-# Line 2: full stats (shown on 2.1.72, dropped on 2.1.74)
-echo "🕐 ${now} ⏱ ${duration} • 📊 ${pct}% (${used_k}k/${max_k}k) • ${compact_icon} • 🤖 ${model}"
+[ -n "$rl_wk_line" ] && echo "$rl_wk_line"
