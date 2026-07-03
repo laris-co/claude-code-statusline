@@ -117,42 +117,39 @@ if [ -n "$branch" ]; then
   git="  ${branch}${d}${wt}"
 fi
 
-# Active Claude token — identify by the SESSION's real credential (inherited env),
-# never the directory's .envrc label: `token-cli use` while a session runs flips
-# the directory label but not the session's auth (2026-07-03 argus mislabel bug).
+# Active Claude token — token-cli current reads the oracle root's .envrc (user
+# intent via `token-cli use`). Walk up from cwd to find .envrc like direnv does.
+# The old bug was cd'ing into a subdir that has no .envrc and losing the label.
 tok=""
 TOK_MAP="$HOME/.oracle/token-hash-map"
-# Precedence mirrors Claude Code's documented credential order (authentication docs):
-# AUTH_TOKEN > API_KEY > OAUTH_TOKEN > /login. (Approximation: an interactively
-# declined API key would fall through to OAuth, which env inspection can't see.)
-real_cred="${ANTHROPIC_AUTH_TOKEN:-${ANTHROPIC_API_KEY:-${CLAUDE_CODE_OAUTH_TOKEN:-}}}"
-if [ -n "$real_cred" ]; then
-  cred_hash=$(printf '%s' "$real_cred" | shasum -a 256 | cut -c1-8)
-  [ -f "$TOK_MAP" ] && tok=$(awk -v h="$cred_hash" '$1==h{print $2; exit}' "$TOK_MAP" 2>/dev/null)
-  if [ -z "$tok" ]; then
-    tok="#$(printf '%s' "$cred_hash" | cut -c1-5)"
-    # Refresh hash→name map from pass, async, at most hourly (touch = debounce).
-    if [ ! -f "$TOK_MAP" ] || [ -n "$(find "$TOK_MAP" -mmin +60 2>/dev/null)" ]; then
-      mkdir -p "$HOME/.oracle"; touch "$TOK_MAP"
-      ( for name in $(pass ls claude 2>/dev/null | grep -o 'token-[A-Za-z0-9._-]*' | sort -u); do
-          v=$(pass show "claude/$name" 2>/dev/null | head -1 | tr -d '\n')
-          [ -n "$v" ] && printf '%s %s\n' "$(printf '%s' "$v" | shasum -a 256 | cut -c1-8)" "${name#token-}"
-        done > "$TOK_MAP.tmp.$$"
-        # gpg can fail silently in a detached shell — never install an empty map
-        if [ -s "$TOK_MAP.tmp.$$" ]; then mv "$TOK_MAP.tmp.$$" "$TOK_MAP"; else rm -f "$TOK_MAP.tmp.$$"; fi ) >/dev/null 2>&1 &
+if command -v token-cli >/dev/null 2>&1; then
+  walk="$cwd"
+  for _ in 1 2 3 4 5 6; do
+    if [ -f "$walk/.envrc" ]; then
+      tok=$(cd "$walk" 2>/dev/null && timeout 1 token-cli current 2>/dev/null)
+      [ -n "$tok" ] && break
     fi
-  fi
-else
-  # No env credential → session runs on the machine's OAuth login.
-  # Hash the refreshToken from credentials file — stable per-account (doesn't
-  # rotate every API call like accessToken), and reverse-map through the same map.
-  rt=$(jq -r '.claudeAiOauth.refreshToken // empty' "$HOME/.claude/.credentials.json" 2>/dev/null)
-  if [ -n "$rt" ]; then
-    cred_hash=$(printf '%s' "$rt" | shasum -a 256 | cut -c1-8)
+    parent=$(dirname "$walk")
+    [ "$parent" = "$walk" ] && break
+    walk="$parent"
+  done
+fi
+# Fallback: hash the real credential or OAuth refreshToken
+if [ -z "$tok" ]; then
+  real_cred="${ANTHROPIC_AUTH_TOKEN:-${ANTHROPIC_API_KEY:-${CLAUDE_CODE_OAUTH_TOKEN:-}}}"
+  if [ -n "$real_cred" ]; then
+    cred_hash=$(printf '%s' "$real_cred" | shasum -a 256 | cut -c1-8)
     [ -f "$TOK_MAP" ] && tok=$(awk -v h="$cred_hash" '$1==h{print $2; exit}' "$TOK_MAP" 2>/dev/null)
     [ -z "$tok" ] && tok="#$(printf '%s' "$cred_hash" | cut -c1-5)"
   else
-    tok="#oauth"
+    rt=$(jq -r '.claudeAiOauth.refreshToken // empty' "$HOME/.claude/.credentials.json" 2>/dev/null)
+    if [ -n "$rt" ]; then
+      cred_hash=$(printf '%s' "$rt" | shasum -a 256 | cut -c1-8)
+      [ -f "$TOK_MAP" ] && tok=$(awk -v h="$cred_hash" '$1==h{print $2; exit}' "$TOK_MAP" 2>/dev/null)
+      [ -z "$tok" ] && tok="#$(printf '%s' "$cred_hash" | cut -c1-5)"
+    else
+      tok="#oauth"
+    fi
   fi
 fi
 tok_info=""
