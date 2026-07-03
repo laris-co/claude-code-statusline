@@ -144,7 +144,16 @@ if [ -n "$real_cred" ]; then
   fi
 else
   # No env credential → session runs on the machine's OAuth login.
-  tok="oauth"
+  # Hash the refreshToken from credentials file — stable per-account (doesn't
+  # rotate every API call like accessToken), and reverse-map through the same map.
+  rt=$(jq -r '.claudeAiOauth.refreshToken // empty' "$HOME/.claude/.credentials.json" 2>/dev/null)
+  if [ -n "$rt" ]; then
+    cred_hash=$(printf '%s' "$rt" | shasum -a 256 | cut -c1-8)
+    [ -f "$TOK_MAP" ] && tok=$(awk -v h="$cred_hash" '$1==h{print $2; exit}' "$TOK_MAP" 2>/dev/null)
+    [ -z "$tok" ] && tok="#$(printf '%s' "$cred_hash" | cut -c1-5)"
+  else
+    tok="#oauth"
+  fi
 fi
 tok_info=""
 [ -n "$tok" ] && tok_info=" 🔐${tok}"
