@@ -117,10 +117,34 @@ if [ -n "$branch" ]; then
   git="  ${branch}${d}${wt}"
 fi
 
-# Active Claude token — via token-cli current (fast, cached .envrc parse)
+# Active Claude token — identify by the SESSION's real credential (inherited env),
+# never the directory's .envrc label: `token-cli use` while a session runs flips
+# the directory label but not the session's auth (2026-07-03 argus mislabel bug).
 tok=""
-if command -v token-cli >/dev/null 2>&1; then
-  tok=$(cd "$cwd" 2>/dev/null && timeout 1 token-cli current 2>/dev/null)
+TOK_MAP="$HOME/.oracle/token-hash-map"
+# Precedence mirrors Claude Code's documented credential order (authentication docs):
+# AUTH_TOKEN > API_KEY > OAUTH_TOKEN > /login. (Approximation: an interactively
+# declined API key would fall through to OAuth, which env inspection can't see.)
+real_cred="${ANTHROPIC_AUTH_TOKEN:-${ANTHROPIC_API_KEY:-${CLAUDE_CODE_OAUTH_TOKEN:-}}}"
+if [ -n "$real_cred" ]; then
+  cred_hash=$(printf '%s' "$real_cred" | shasum -a 256 | cut -c1-8)
+  [ -f "$TOK_MAP" ] && tok=$(awk -v h="$cred_hash" '$1==h{print $2; exit}' "$TOK_MAP" 2>/dev/null)
+  if [ -z "$tok" ]; then
+    tok="#$(printf '%s' "$cred_hash" | cut -c1-5)"
+    # Refresh hash→name map from pass, async, at most hourly (touch = debounce).
+    if [ ! -f "$TOK_MAP" ] || [ -n "$(find "$TOK_MAP" -mmin +60 2>/dev/null)" ]; then
+      mkdir -p "$HOME/.oracle"; touch "$TOK_MAP"
+      ( for name in $(pass ls claude 2>/dev/null | grep -o 'token-[A-Za-z0-9._-]*' | sort -u); do
+          v=$(pass show "claude/$name" 2>/dev/null | head -1 | tr -d '\n')
+          [ -n "$v" ] && printf '%s %s\n' "$(printf '%s' "$v" | shasum -a 256 | cut -c1-8)" "${name#token-}"
+        done > "$TOK_MAP.tmp.$$"
+        # gpg can fail silently in a detached shell — never install an empty map
+        if [ -s "$TOK_MAP.tmp.$$" ]; then mv "$TOK_MAP.tmp.$$" "$TOK_MAP"; else rm -f "$TOK_MAP.tmp.$$"; fi ) >/dev/null 2>&1 &
+    fi
+  fi
+else
+  # No env credential → session runs on the machine's OAuth login.
+  tok="oauth"
 fi
 tok_info=""
 [ -n "$tok" ] && tok_info=" 🔐${tok}"
@@ -220,12 +244,13 @@ if command -v mosquitto_pub >/dev/null 2>&1 && command -v pass >/dev/null 2>&1; 
       --arg machine "$mqtt_host" \
       --arg dir "$dir" \
       --arg dirty "${d:-}" \
+      --arg account "${tok:-}" \
       --argjson published_at "$published_at" \
       --argjson corrected_max_k "${max_k:-0}" \
       --argjson corrected_used_k "${used_k:-0}" \
       --argjson corrected_pct "${pct:-0}" \
       --argjson remaining_k "$(( max_k - used_k > 0 ? max_k - used_k : 0 ))" \
-      '. + {oracle: $oracle, machine: $machine, branch: $branch, branch_dirty: ($dirty != ""), worktree: $wt_short, worktree_branch: $wt_branch, federation: $fed, short_dir: $dir, published_at: $published_at, context_window: (.context_window + {corrected_window_size: ($corrected_max_k * 1000), corrected_used_k: $corrected_used_k, corrected_pct: $corrected_pct, remaining_k: $remaining_k})}' \
+      '. + {oracle: $oracle, machine: $machine, branch: $branch, branch_dirty: ($dirty != ""), worktree: $wt_short, worktree_branch: $wt_branch, federation: $fed, short_dir: $dir, account: $account, published_at: $published_at, context_window: (.context_window + {corrected_window_size: ($corrected_max_k * 1000), corrected_used_k: $corrected_used_k, corrected_pct: $corrected_pct, remaining_k: $remaining_k})}' \
       2>/dev/null)
     [ -z "$enriched" ] && enriched="$input"
     (printf '%s' "$enriched" | mosquitto_pub -h mqtt.laris.co -p 1883 -u nat -P "$mqtt_pass" -t "$mqtt_topic" -s -q 0 -r &) 2>/dev/null
@@ -260,3 +285,8 @@ elif [ -n "$fed_line" ]; then
   echo "🌐 ${fed_line}"
 fi
 [ -n "$rl_wk_line" ] && echo "$rl_wk_line"
+
+# Per-token usage snapshot — append-only ~/.claude/token-usage.jsonl.
+# Backgrounded + fully guarded: can never block or break the statusline.
+# Throttling (5 min per token) happens inside token-usage itself.
+{ (printf '%s' "$input" | "$HOME/.local/bin/token-usage" log >/dev/null 2>&1 &) ; } 2>/dev/null || true
