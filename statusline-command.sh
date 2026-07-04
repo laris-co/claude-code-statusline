@@ -118,26 +118,15 @@ if [ -n "$branch" ]; then
 fi
 
 # Active Claude token — token identity is a REPO-level property (1 repo = 1
-# intended account), so resolve from the GIT ROOT's .envrc, not the nearest.
-# Nearest-wins (direnv semantics) mislabels when a subdir carries a stray
-# .envrc (e.g. `maw token use X` run in a subdir during a deploy) — the
-# git-root guard walks up FROM the repo root, skipping subdir .envrc below it.
+# intended account), so read CLAUDE_TOKEN_NAME straight from the GIT ROOT's
+# .envrc. Pure grep — no token-cli Python spawn (~40ms), no walk loop.
+# Reading the git-root .envrc (not the nearest) skips stray subdir .envrc
+# written by `maw token use X` run in a subdir during a deploy.
 tok=""
 TOK_MAP="$HOME/.oracle/token-hash-map"
-if command -v token-cli >/dev/null 2>&1; then
-  # Start the walk at the git root (falls back to cwd outside a repo), so any
-  # .envrc nested below the repo root is ignored.
-  gitroot=$(timeout 1 git -C "$cwd" rev-parse --show-toplevel 2>/dev/null)
-  walk="${gitroot:-$cwd}"
-  for _ in 1 2 3 4 5 6; do
-    if [ -f "$walk/.envrc" ]; then
-      tok=$(cd "$walk" 2>/dev/null && timeout 1 token-cli current 2>/dev/null)
-      [ -n "$tok" ] && break
-    fi
-    parent=$(dirname "$walk")
-    [ "$parent" = "$walk" ] && break
-    walk="$parent"
-  done
+gitroot=$(timeout 1 git -C "$cwd" rev-parse --show-toplevel 2>/dev/null)
+if [ -f "${gitroot:-$cwd}/.envrc" ]; then
+  tok=$(grep -m1 -oE 'CLAUDE_TOKEN_NAME="[^"]*"' "${gitroot:-$cwd}/.envrc" 2>/dev/null | sed 's/.*="//; s/"$//')
 fi
 # Fallback: hash the real credential or OAuth refreshToken
 if [ -z "$tok" ]; then
