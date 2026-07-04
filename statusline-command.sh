@@ -117,13 +117,18 @@ if [ -n "$branch" ]; then
   git="  ${branch}${d}${wt}"
 fi
 
-# Active Claude token — token-cli current reads the oracle root's .envrc (user
-# intent via `token-cli use`). Walk up from cwd to find .envrc like direnv does.
-# The old bug was cd'ing into a subdir that has no .envrc and losing the label.
+# Active Claude token — token identity is a REPO-level property (1 repo = 1
+# intended account), so resolve from the GIT ROOT's .envrc, not the nearest.
+# Nearest-wins (direnv semantics) mislabels when a subdir carries a stray
+# .envrc (e.g. `maw token use X` run in a subdir during a deploy) — the
+# git-root guard walks up FROM the repo root, skipping subdir .envrc below it.
 tok=""
 TOK_MAP="$HOME/.oracle/token-hash-map"
 if command -v token-cli >/dev/null 2>&1; then
-  walk="$cwd"
+  # Start the walk at the git root (falls back to cwd outside a repo), so any
+  # .envrc nested below the repo root is ignored.
+  gitroot=$(timeout 1 git -C "$cwd" rev-parse --show-toplevel 2>/dev/null)
+  walk="${gitroot:-$cwd}"
   for _ in 1 2 3 4 5 6; do
     if [ -f "$walk/.envrc" ]; then
       tok=$(cd "$walk" 2>/dev/null && timeout 1 token-cli current 2>/dev/null)
